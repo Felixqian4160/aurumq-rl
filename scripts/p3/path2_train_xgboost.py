@@ -104,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3. Predict on full eval frame
     X_all = df.select(feature_cols).to_numpy()
+    X_all[~np.isfinite(X_all)] = 0.0
     score_all = model.predict(X_all).astype(np.float32)
     pred_df = df.select(["trade_date", "ts_code"]).with_columns(pl.Series("score", score_all))
 

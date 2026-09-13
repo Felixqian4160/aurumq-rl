@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     # Defaults preserve original 2023-2024 short-panel TRAIN_EFF.
     ap.add_argument("--train-start", default=None, help="ISO date; overrides TRAIN_EFF[0]")
     ap.add_argument("--train-end", default=None, help="ISO date; overrides TRAIN_EFF[1]")
+    ap.add_argument("--gpu", action="store_true", help="Use GPU for LightGBM training")
     args = ap.parse_args(argv)
 
     # Apply window overrides
@@ -111,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("target_y: %d rows", len(target_y))
         df = feat_df.join(target_y, on=["trade_date", "ts_code"], how="inner")
         logger.info("joined: %d rows", len(df))
+
+    # 0.5. Ensure trade_date is Date type (P3 bundles may store as String)
+    if df["trade_date"].dtype == pl.String:
+        df = df.with_columns(pl.col("trade_date").str.slice(0, 10).str.to_date("%Y-%m-%d"))
+        logger.info("converted trade_date to Date type")
 
     # 2. Split by trade_date (using overridable window for Path D long panel)
     logger.info("TRAIN window: [%s, %s]", train_eff_lo, train_eff_hi)
@@ -145,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
         "seed": args.seed,
         "n_jobs": args.n_jobs,
     }
+    if args.gpu:
+        params["device"] = "gpu"
+        params["gpu_use_dp"] = False
+        logger.info("using GPU for training")
     logger.info("training: %s", {k: v for k, v in params.items() if k != "metric"})
     t1 = time.time()
     model = lgb.train(
@@ -174,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     # AS NUMPY first so we can drop the polars frame before allocating X_all.
     pred_meta = df.select(["trade_date", "ts_code"])
     X_all = df.select(feature_cols).to_numpy()
+    X_all[~np.isfinite(X_all)] = 0.0
     del df
     gc.collect()
 
@@ -188,13 +199,33 @@ def main(argv: list[str] | None = None) -> int:
     model.save_model(str(args.out / "lgb_model.txt"))
     np.savez(args.out / "predictions.npz", score=score_all)
 
+    # Save metadata for WebUI display
+    n_stocks = pred_meta["ts_code"].n_unique()
+    meta = {
+        "n_stocks": n_stocks,
+        "total_timesteps": n_train_rows,
+        "best_iteration": model.best_iteration,
+        "train_time_s": round(train_time, 1),
+        "features": len(feature_cols),
+    }
+    (args.out / "metadata.json").write_text(json.dumps(meta, indent=2))
+    logger.info("saved metadata.json: %d stocks, %d train rows", n_stocks, n_train_rows)
+
     # 6. Eval on VAL_EFF, H1, H2
     realized = pl.read_parquet(args.bundle / "realized_returns.parquet").select(
-        ["trade_date", "ts_code", "pct_chg_t_plus_1"]
+        ["trade_date", "ts_code", pl.col("return_1d").alias("pct_chg_t_plus_1")]
     )
-    market = pl.read_parquet(args.bundle / "market_returns.parquet").select(
-        ["trade_date", "eq_weight_pct_chg_t_plus_1"]
-    )
+    # market_returns.parquet may not exist; use equal-weight fallback
+    market_path = args.bundle / "market_returns.parquet"
+    if market_path.exists():
+        market = pl.read_parquet(market_path).select(
+            ["trade_date", pl.col("eq_weight_pct_chg_t_plus_1")]
+        )
+    else:
+        # Build equal-weight market return from realized_returns
+        market = realized.group_by("trade_date").agg(
+            pl.col("pct_chg_t_plus_1").mean().alias("eq_weight_pct_chg_t_plus_1")
+        ).select(["trade_date", "eq_weight_pct_chg_t_plus_1"])
     val_eval = evaluate(pred_df, target_y, realized, market, VAL_EFF)
     h1_eval = evaluate(pred_df, target_y, realized, market, H1)
     h2_eval = evaluate(pred_df, target_y, realized, market, H2)

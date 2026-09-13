@@ -128,20 +128,41 @@ class RlAgentInference:
         obs = np.asarray(observation, dtype=np.float32)
 
         expected = self._metadata.obs_shape
-        if obs.shape == expected:
-            obs_batched = obs[np.newaxis, ...]
-        elif obs.ndim == len(expected) + 1 and obs.shape[1:] == expected:
-            obs_batched = obs
-        else:
-            raise ValueError(f"observation shape mismatch: got {obs.shape}, expected {expected}")
+        # 检测 ONNX 期望的 rank（来自 metadata.obs_shape 的维度数）
+        # 2D obs_shape → ONNX 期望 2D (batch, F)  [legacy MLP]
+        # 3D obs_shape → ONNX 期望 3D (batch, S, F)  [PerStockEncoderPolicy]
+        n_obs_dims = len(expected)
 
-        # ORT prefers 2D input (batch, features)
-        batch_size = obs_batched.shape[0]
-        obs_flat = obs_batched.reshape(batch_size, -1)
+        if n_obs_dims == 1:
+            # MLP flatten: 1D obs → 2D (1, F)
+            if obs.shape == expected:
+                obs_input = obs[np.newaxis, ...]
+            elif obs.ndim == 2 and obs.shape[1:] == expected:
+                obs_input = obs
+            else:
+                raise ValueError(f"observation shape mismatch: got {obs.shape}, expected {expected}")
+        elif n_obs_dims == 2:
+            # Legacy: 2D obs → 3D (batch=1, S, F)
+            if obs.shape == expected:
+                obs_input = obs[np.newaxis, ...]
+            elif obs.ndim == 3 and obs.shape[1:] == expected:
+                obs_input = obs
+            else:
+                raise ValueError(f"observation shape mismatch: got {obs.shape}, expected {expected}")
+        elif n_obs_dims == 3:
+            # PerStockEncoderPolicy: 3D obs → 4D (batch=1, T, S, F) ?? no — keep 3D
+            if obs.shape == expected:
+                obs_input = obs[np.newaxis, ...]   # (1, T, S, F)
+            elif obs.ndim == 4 and obs.shape[1:] == expected:
+                obs_input = obs
+            else:
+                raise ValueError(f"observation shape mismatch: got {obs.shape}, expected {expected}")
+        else:
+            raise ValueError(f"unsupported obs_shape dim: {n_obs_dims}")
 
         outputs = self._session.run(
             [self._output_name],
-            {self._input_name: obs_flat},
+            {self._input_name: obs_input.astype(np.float32)},
         )
         action = outputs[0][0]
         return action.astype(np.float32)

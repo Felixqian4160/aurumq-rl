@@ -70,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     start = date.fromisoformat(args.start_date)
     end = date.fromisoformat(args.end_date)
-    raw = pl.read_parquet(args.raw_features).filter(
+    raw = pl.read_parquet(args.raw_features)
+    # Ensure trade_date is Date type (P3 bundles may store as String)
+    if raw["trade_date"].dtype == pl.String:
+        raw = raw.with_columns(pl.col("trade_date").str.slice(0, 10).str.to_date("%Y-%m-%d"))
+    raw = raw.filter(
         (pl.col("trade_date") >= start) & (pl.col("trade_date") <= end)
     )
     logger.info("loaded raw features: %d rows in [%s, %s] (%.1fs)",

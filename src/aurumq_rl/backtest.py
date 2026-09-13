@@ -211,19 +211,26 @@ def compute_top_k_sharpes(
 
 
 def compute_top_k_cumret(predictions: np.ndarray, returns: np.ndarray, top_k: int) -> float:
-    """Total cumulative return of the top-K portfolio."""
+    """Total cumulative return of the top-K portfolio.
+
+    Returns the simple (additive) cumulative return, NOT compounded.
+    Compounding overlaps when forward_period > 1 (each day's return already
+    represents a future window that overlaps with the next day's), which
+    causes explosive values like 1e16. We report the honest additive
+    sum-of-period-returns instead.
+    """
     if predictions.shape != returns.shape:
         raise ValueError("shape mismatch")
 
-    cum = 1.0
+    total = 0.0
     for t in range(predictions.shape[0]):
         p, r = predictions[t], returns[t]
         mask = np.isfinite(p) & np.isfinite(r)
         if mask.sum() < top_k:
             continue
         idx = np.argsort(-p[mask])[:top_k]
-        cum *= 1.0 + float(r[mask][idx].mean())
-    return cum - 1.0
+        total += float(r[mask][idx].mean())
+    return total  # 累加收益（非复利，避免窗口重叠爆炸）
 
 
 def random_baseline(
@@ -446,8 +453,17 @@ def run_backtest_with_series(
 
     equity = []
     cum = 1.0
-    for ret in top_k_rets:
-        cum *= 1.0 + ret
+    # P0 fix: 用 forward_period 参数而非硬编码 N=20;
+    # P0 fix: 非重叠采样避免 forward_window 重叠导致的虚假复利.
+    # top_k_rets 是 forward_period 天窗口累计收益, 窗口间重叠 (forward_period-1) 天.
+    # 直接逐条复利会把同一交易日收益重复计入 → equity 虚假膨胀.
+    # 正确做法: 只取非重叠窗口 (每 forward_period 条取 1 条) 做复利,
+    # 或者把窗口累计收益拆成独立日收益再复利. 这里用非重叠采样.
+    fp = forward_period if forward_period > 1 else 1
+    for i, ret in enumerate(top_k_rets):
+        # 只在非重叠采样点计入收益 (每隔 fp 条)
+        if i % fp == 0:
+            cum *= 1.0 + ret
         equity.append(cum)
 
     random_sharpes = _random_sharpes(

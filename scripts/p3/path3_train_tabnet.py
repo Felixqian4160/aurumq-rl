@@ -63,20 +63,26 @@ def main(argv: list[str] | None = None) -> int:
     df = feat_df.join(target_y, on=["trade_date", "ts_code"], how="inner")
     logger.info("joined: %d rows", len(df))
 
+    # Ensure trade_date is Date type (P3 bundles may store as String)
+    if df["trade_date"].dtype == pl.String:
+        df = df.with_columns(pl.col("trade_date").str.slice(0, 10).str.to_date("%Y-%m-%d"))
+        logger.info("converted trade_date to Date type")
+
     train_df = df.filter((pl.col("trade_date") >= TRAIN_EFF[0]) & (pl.col("trade_date") <= TRAIN_EFF[1]))
     val_df = df.filter((pl.col("trade_date") >= VAL_EFF[0]) & (pl.col("trade_date") <= VAL_EFF[1]))
     logger.info("splits: train=%d val=%d", len(train_df), len(val_df))
 
-    # NaN → 0.0 (median-equivalent under rank-z scaling)
+    # NaN/inf → 0.0 (median-equivalent under rank-z scaling)
     X_train = train_df.select(feature_cols).fill_null(0.0).to_numpy().astype(np.float32)
     y_train = train_df["y"].to_numpy().astype(np.float32).reshape(-1, 1)
     X_val = val_df.select(feature_cols).fill_null(0.0).to_numpy().astype(np.float32)
     y_val = val_df["y"].to_numpy().astype(np.float32).reshape(-1, 1)
 
-    # NaN check (any infs would also fail tabnet)
-    if not np.isfinite(X_train).all():
-        logger.error("X_train has non-finite values; tabnet cannot proceed")
-        return 2
+    # Replace inf → 0.0 (TabNet cannot handle non-finite)
+    X_train[~np.isfinite(X_train)] = 0.0
+    X_val[~np.isfinite(X_val)] = 0.0
+    y_train[~np.isfinite(y_train)] = 0.0
+    y_val[~np.isfinite(y_val)] = 0.0
 
     # 2. Train TabNet
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3. Predict on full eval frame
     X_all = df.select(feature_cols).fill_null(0.0).to_numpy().astype(np.float32)
+    X_all[~np.isfinite(X_all)] = 0.0
     score_all = model.predict(X_all).flatten().astype(np.float32)
     pred_df = df.select(["trade_date", "ts_code"]).with_columns(pl.Series("score", score_all))
 
@@ -123,11 +130,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Eval
     realized = pl.read_parquet(args.bundle / "realized_returns.parquet").select(
-        ["trade_date", "ts_code", "pct_chg_t_plus_1"]
+        ["trade_date", "ts_code", pl.col("return_1d").alias("pct_chg_t_plus_1")]
     )
-    market = pl.read_parquet(args.bundle / "market_returns.parquet").select(
-        ["trade_date", "eq_weight_pct_chg_t_plus_1"]
-    )
+    market_path = args.bundle / "market_returns.parquet"
+    if market_path.exists():
+        market = pl.read_parquet(market_path).select(
+            ["trade_date", "eq_weight_pct_chg_t_plus_1"]
+        )
+    else:
+        market = realized.group_by("trade_date").agg(
+            pl.col("pct_chg_t_plus_1").mean().alias("eq_weight_pct_chg_t_plus_1")
+        ).select(["trade_date", "eq_weight_pct_chg_t_plus_1"])
     val_eval = evaluate(pred_df, target_y, realized, market, VAL_EFF)
     h1_eval = evaluate(pred_df, target_y, realized, market, H1)
     h2_eval = evaluate(pred_df, target_y, realized, market, H2)

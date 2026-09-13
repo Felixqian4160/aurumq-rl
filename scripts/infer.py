@@ -93,8 +93,10 @@ def main(argv: list[str] | None = None) -> int:
     start_date = eval_date - datetime.timedelta(days=args.lookback_days)
     universe = UniverseFilter(args.universe_filter)
 
-    # 1) Load agent
-    agent = RlAgentInference(args.model)
+    # 1) Load agent — 兼容传文件路径或目录
+    model_arg = Path(args.model)
+    model_dir = model_arg if model_arg.is_dir() else model_arg.parent
+    agent = RlAgentInference(model_dir)
     print(
         f"[infer] loaded {agent.metadata.algorithm} agent "
         f"(trained for {agent.metadata.training_timesteps:,} steps)",
@@ -131,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         factor_names=train_factor_names,
     )
 
-    if eval_date not in panel.dates:
+    if eval_date not in [d.date() if isinstance(d, datetime.datetime) else d for d in panel.dates]:
         print(
             f"[ERROR] {eval_date} not found in Parquet (covers {panel.dates[0]} to {panel.dates[-1]})",
             file=sys.stderr,
@@ -152,8 +154,13 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
-    # Find the time index for eval_date
-    t_idx = panel.dates.index(eval_date)
+    # Find the time index for eval_date (panel.dates may be datetime while eval_date is date)
+    t_idx = None
+    for i, d in enumerate(panel.dates):
+        if d == eval_date or (isinstance(d, datetime.datetime) and d.date() == eval_date):
+            t_idx = i; break
+    if t_idx is None:
+        print(f"[ERROR] {eval_date} not found after alignment", file=sys.stderr); return 1
     obs_2d = panel.factor_array[t_idx]  # (n_train_stocks, n_factors)
 
     # 3) Run inference. After alignment the obs dim MUST equal the model's

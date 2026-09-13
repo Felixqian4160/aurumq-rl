@@ -101,6 +101,103 @@ FACTOR_COL_PREFIXES: tuple[str, ...] = (
     "zt_",  # Phase 26 — limit-up streak metrics
 )
 
+# Bare-name fundamental columns (no prefix) — Tushare fina_indicator fields
+# merged by scripts/build_factor_panel.py. These are recognized as factors
+# even though they don't carry a prefix, so LSTM/PPO training uses them too.
+FUNDAMENTAL_COLUMNS: tuple[str, ...] = (
+    # 盈利能力
+    "roe",
+    "roe_waa",
+    "roa",
+    "grossprofit_margin",
+    "netprofit_margin",
+    # 偿债能力
+    "debt_to_assets",
+    "current_ratio",
+    "quick_ratio",
+    # 每股指标
+    "bps",
+    "cfps",
+    "ocfps",
+    # 成长能力
+    "netprofit_yoy",
+    "or_yoy",
+    "ocf_yoy",
+    # 运营效率
+    "assets_turn",
+    # 现金流
+    "fcff",
+    # 估值（daily_basic）
+    "pe",
+    "pb",
+    "dv_ttm",
+    "total_mv",
+    "circ_mv",
+    "turnover_rate",
+    "volume_ratio",
+)
+
+# ═══════════════════════════════════════════════════════════════════════
+# Blacklist-based factor discovery (v2)
+#
+# 因子识别改为"黑名单"模式：排除元数据/辅助列后，其余所有列都是因子。
+# 好处：面板未来新增任意因子列（q_roe / ocf_to_or / free_cashflow_yoy ...）
+# 都会自动被训练使用，不需要每次改白名单。
+#
+# 这些列即使数值类型，也不是因子（元数据/价格/成交量/标记）。
+# 注意：close/pct_chg/vol 是 REQUIRED_COLUMNS（构造 return/panel 用），
+# 但绝不能进 factor_array —— 它们不是截面因子，且 close 受复权污染。
+# ═══════════════════════════════════════════════════════════════════════
+NON_FACTOR_COLUMNS: tuple[str, ...] = (
+    # 元数据 / 标识
+    "ts_code",
+    "trade_date",
+    "date",
+    "stock_code",
+    "name",
+    # 原始行情（非因子）— WaveHunter v3 起 open/high/low/close/amount 进因子
+    # （K线形态 + 放量特征，主升浪启动核心信号）
+    "pre_close",
+    "pct_chg",
+    "vol",
+    "volume",
+    "adj_close",  # 复权价：只用于 A1/A2 标签计算，不进 obs（与 close 冗余）
+    # 辅助标记（UniverseFilter 用）
+    "is_st",
+    "days_since_ipo",
+    "industry_code",
+    "adj_factor",
+    "trade_status",
+    # 市场状态标记（v2 面板附加列，非因子）
+    "regime",
+    "regime_score",
+    "stock_pool",
+    # v8 双重确认标签/未来结果：全部排除出 observation。
+    "a1_low_zone", "a1_oversold", "a1_reversal_start", "a1_reversal_pre_signal",
+    "a1_reversal_confirmed", "a1_reversal_success_5d", "a1_reversal_success_10d",
+    "a1_reversal_success_20d", "a1_main_wave_success", "a2_continue_candidate",
+    "a2_continue_start", "a2_start", "a2_continue_5d", "a2_continue_10d",
+    "a2_continue_20d", "a2_main_wave_success", "a2_exit_risk", "exit_top_reversal",
+    "swing_bottom", "swing_top", "swing_type", "zig_bottom", "zig_top", "zig_signal",
+    "zig_trend", "zig_atr", "v4_bottom", "v4_top", "v7_bottom", "v7_top",
+    "combined_bottom_candidate", "combined_top_candidate", "combined_match_distance",
+    # v9 ZigZag 真实高低点标签（监督目标，不进 obs）— B1=筑底(峰→谷), A1=谷, A2=谷→峰
+    "v9_zig_peak", "v9_zig_valley", "v9_a1_point", "v9_a2_interval", "v9_a2_start", "v9_down_interval", "v9_down_start", "v9_b1_interval", "v9_b1_start",
+    # v10 EVT/OU 事后标签与辅助统计（监督目标，不进 observation）。
+    "v10_evt_peak", "v10_evt_valley", "v10_peak_excess", "v10_valley_excess", "v10_ou_b1", "v10_ou_b1_start", "v10_ou_b1_interval", "v10_ou_b1_excess",
+    # v10 EVT 标签与因果评分（事后监督目标，不进 observation）。
+    "v10_evt_score", "v10_evt_trend_score", "v10_evt_cumulative_swing",
+    # v10 独立面板监督目标（不进 observation）：CSI500 独立构建器实际生成字段。
+    "v10_zig_peak", "v10_zig_valley",
+    "v10_a1_point", "v10_a2_interval", "v10_a2_start",
+    "v10_b1_interval", "v10_b1_start",
+    "v10_down_interval", "v10_down_start",
+    "v10_1_zig_peak", "v10_1_zig_valley", "v10_1_peak_zone", "v10_1_valley_zone",
+    "v10_1_a1_point", "v10_1_a2_interval", "v10_1_a2_start",
+    "v10_1_b1_interval", "v10_1_b1_start",
+    "v10_1_down_interval", "v10_1_down_start",
+)
+
 # Required columns in input Parquet
 REQUIRED_COLUMNS: tuple[str, ...] = ("ts_code", "trade_date", "close", "pct_chg", "vol")
 
@@ -224,6 +321,17 @@ class FactorPanel(NamedTuple):
         :func:`aurumq_rl.price_limits.compute_at_limit_masks` to
         reconstruct rounded limit prices (M7); price-limit rules operate
         on raw exchange prices, so this stays unadjusted.
+    amount_array:
+        RAW (unadjusted) daily turnover amount (元), shape (n_dates, n_stocks),
+        NaN for missing cells. Used for low-liquidity filtering in
+        ``build_tradeable_mask`` (amount < 5% of stock's own average → cannot fill).
+    open_array:
+        shape (n_dates, n_stocks), RAW (unadjusted) open prices with NaN
+        for missing cells, or ``None`` when the source has no prices.  P0
+        bridge plumbing for the v10_1 training env (``use_shared_sm=True``)
+        needs T+1 raw-open prices for :meth:`TradingStateMachine.execute_open`;
+        without this the SM path is unavailable and the trainer must fall back
+        to the legacy LstmWeightEnv cost model.
     """
 
     factor_array: np.ndarray
@@ -236,6 +344,16 @@ class FactorPanel(NamedTuple):
     stock_codes: list[str]
     factor_names: list[str]
     close_array: np.ndarray | None = None
+    # RAW (unadjusted) daily turnover amount (元), shape (n_dates, n_stocks),
+    # NaN for missing cells. Used for low-liquidity filtering in
+    # build_tradeable_mask (amount < 5% of stock's own average → cannot fill).
+    amount_array: np.ndarray | None = None
+    # RAW (unadjusted) daily OPEN price, shape (n_dates, n_stocks), NaN for
+    # missing cells. Required by the v10_1 P0 trading-state-machine bridge
+    # (T close signal → T+1 raw-open execution).  Panels without this column
+    # keep ``None`` and the SM path raises a clear error rather than silently
+    # using the wrong price.
+    open_array: np.ndarray | None = None
 
 
 def align_panel_to_stock_list(panel: FactorPanel, target_stock_codes: list[str]) -> FactorPanel:
@@ -283,9 +401,10 @@ def align_panel_to_stock_list(panel: FactorPanel, target_stock_codes: list[str])
     is_st_array = _gather(panel.is_st_array, True)  # missing → ST (un-tradeable)
     is_suspended_array = _gather(panel.is_suspended_array, True)  # missing → suspended
     days_since_ipo_array = _gather(panel.days_since_ipo_array, 0)
-    # missing → NaN close (price-limit detection falls back to pct epsilon)
-    close_array = _gather(panel.close_array, np.nan) if panel.close_array is not None else None
 
+    close_array = _gather(panel.close_array, np.nan) if panel.close_array is not None else None
+    amount_array = _gather(panel.amount_array, np.nan) if panel.amount_array is not None else None
+    open_array = _gather(panel.open_array, np.nan) if panel.open_array is not None else None
     return FactorPanel(
         factor_array=factor_array,
         return_array=return_array,
@@ -297,6 +416,8 @@ def align_panel_to_stock_list(panel: FactorPanel, target_stock_codes: list[str])
         stock_codes=list(target_stock_codes),
         factor_names=list(panel.factor_names),
         close_array=close_array,
+        amount_array=amount_array,
+        open_array=open_array,
     )
 
 
@@ -351,13 +472,28 @@ def build_tradeable_mask(panel: FactorPanel) -> np.ndarray:
         days_since_ipo=panel.days_since_ipo_array,
         close=panel.close_array,
     )
-    return (
+    mask = (
         (~panel.is_st_array)
         & (~panel.is_suspended_array)
         & (panel.days_since_ipo_array >= NEW_STOCK_PROTECT_DAYS)
         & ~at_up
         & ~at_down
     )
+    # ── Low-liquidity filter (tradeability audit) ──
+    # A cell whose turnover amount is < 5% of that stock's own average is
+    # effectively unfillable at the target price. Without this, backtests
+    # harvest phantom returns from illiquid names (close_amt_ratio trap).
+    # Uses RAW amount (元), never the z-scored factor.
+    if panel.amount_array is not None:
+        amt = panel.amount_array
+        with np.errstate(all='ignore'):
+            avg_amt = np.nanmean(amt, axis=0, keepdims=True)
+            low_volume = (amt < avg_amt * 0.05)
+            # NaN amount (missing cell) → treat as not-low-volume (handled by
+            # suspended mask); only flag cells with a valid tiny amount.
+            low_volume = low_volume & np.isfinite(amt)
+        mask = mask & ~low_volume
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -605,9 +741,12 @@ def _apply_feature_group_weights(
                 f"{weight!r} ({type(weight).__name__})"
             ) from e
 
-        # Empty prefix matches everything; otherwise prefix-match column names.
+        # 精确列名优先（支持裸名基本面列 roe/roa/...）；
+        # 空前缀匹配所有列；其余按前缀匹配列名。
         if prefix == "":
             col_idx = list(range(len(factor_names)))
+        elif prefix in factor_names:
+            col_idx = [i for i, name in enumerate(factor_names) if name == prefix]
         else:
             col_idx = [i for i, name in enumerate(factor_names) if name.startswith(prefix)]
         if not col_idx:
@@ -712,7 +851,15 @@ def discover_factor_columns(
     n_factors: int | None = None,
     prefixes: tuple[str, ...] = FACTOR_COL_PREFIXES,
 ) -> list[str]:
-    """Discover factor columns in a DataFrame by prefix matching.
+    """Discover factor columns in a DataFrame (blacklist mode, v2).
+
+    Every column is a factor EXCEPT:
+    - columns in ``NON_FACTOR_COLUMNS`` (metadata / raw price / volume / flags)
+    - columns whose dtype is not numeric (e.g. string ts_code / date objects)
+
+    This is forward-compatible: new factor columns added to a panel in the
+    future (q_roe, ocf_to_or, free_cashflow_yoy, ...) are picked up
+    automatically — no whitelist maintenance required.
 
     Parameters
     ----------
@@ -722,13 +869,17 @@ def discover_factor_columns(
         If given, truncate to first N columns (alphabetical order).
         If None, return all matched columns.
     prefixes:
-        Recognized prefixes.
+        Kept for backward compatibility; only used as an additional
+        positive match (never excludes).
 
     Returns
     -------
     Sorted list of factor column names.
     """
-    matched = sorted([c for c in df.columns if c.startswith(prefixes)])
+    numeric = {c for c in df.columns if df.schema[c] in (pl.Float32, pl.Float64, pl.Int32, pl.Int64)}
+    prefixed = {c for c in df.columns if c.startswith(prefixes)}
+    non_factor = set(NON_FACTOR_COLUMNS)
+    matched = sorted((numeric | prefixed) - non_factor)
     if n_factors is not None:
         return matched[:n_factors]
     return matched
@@ -872,6 +1023,14 @@ class FactorPanelLoader:
         factor_names: list[str] | None = None,
     ) -> FactorPanel:
         """Convert polars DataFrame to numpy 3D panel."""
+        # 🔴 单位检测 (2026-08-17): 一次检测面板 pct_chg 是百分比(9.97=涨停)
+        # 还是小数(0.0997=涨停)。q99: 百分比≈10, 小数≈0.1。
+        _pct_sample = df["pct_chg"].drop_nulls()
+        _pct_q99 = (
+            _pct_sample.quantile(0.99) if len(_pct_sample) > 0 else 0.0
+        )
+        _pct_is_percent = abs(float(_pct_q99)) > 1.0
+
         dates = df["trade_date"].unique().sort().to_list()
         stock_codes = df["ts_code"].unique().sort().to_list()
 
@@ -912,6 +1071,11 @@ class FactorPanelLoader:
         # actual rows overwrite these defaults below.
         factor_array = np.full((n_dates, n_stocks, n_factors_actual), np.nan, dtype=np.float32)
         close_array = np.full((n_dates, n_stocks), np.nan, dtype=np.float32)
+        amount_array = np.full((n_dates, n_stocks), np.nan, dtype=np.float64)
+        # P0 bridge: T+1 raw-open prices for TradingStateMachine.execute_open.
+        # Optional because legacy / synthetic panels may not have it; the SM
+        # path raises a clear error rather than silently coercing NaN to 0.
+        open_array = np.full((n_dates, n_stocks), np.nan, dtype=np.float32) if "open" in df.columns else None
         pct_change_array = np.zeros((n_dates, n_stocks), dtype=np.float32)
         is_st_array = np.zeros((n_dates, n_stocks), dtype=np.bool_)
         is_suspended_array = np.ones((n_dates, n_stocks), dtype=np.bool_)
@@ -957,13 +1121,27 @@ class FactorPanelLoader:
             close_v = row.get("close")
             if close_v is not None:
                 close_array[t, j] = float(close_v)
+            amt_v = row.get("amount")
+            if amt_v is not None:
+                amount_array[t, j] = float(amt_v)
+            if open_array is not None:
+                open_v = row.get("open")
+                if open_v is not None:
+                    open_array[t, j] = float(open_v)
             if adj_close_array is not None:
                 adj_v = row.get("adj_factor")
                 if close_v is not None and adj_v is not None:
                     adj_close_array[t, j] = float(close_v) * float(adj_v)
             pct_v = row.get("pct_chg")
             if pct_v is not None:
-                pct_change_array[t, j] = float(pct_v)
+                # 🔴 单位自适应 (2026-08-17): 面板 pct_chg 历史上有两种约定
+                #   - 旧面板 (tushare 原值): 百分比 9.97 = 涨停 → 必须 /100 → 小数
+                #   - 新面板 (add_derived_columns 覆盖): 小数 0.0997 = 涨停
+                # 无脑 /100 会把小数面板再缩 100 倍 → 涨停检测 100% 失效。
+                # 修复: 加载时按 q99 检测面板单位, 只有百分比版才 /100。
+                pct_change_array[t, j] = (
+                    float(pct_v) / 100.0 if _pct_is_percent else float(pct_v)
+                )
             vol_v = row.get("vol")
             is_suspended_array[t, j] = (vol_v is None) or (vol_v == 0)
 
@@ -1020,6 +1198,12 @@ class FactorPanelLoader:
             # RAW close (NaN for missing cells) — price limits use exchange
             # prices, never adjusted ones.
             close_array=close_array,
+            # RAW amount (元) — low-liquidity filtering uses unadjusted turnover.
+            amount_array=amount_array,
+            # RAW open (NaN for missing cells) — T+1 raw-open execution price
+            # for the v10_1 P0 trading-state-machine bridge. None when the
+            # parquet lacks an ``open`` column (synthetic / legacy panels).
+            open_array=open_array,
         )
 
     def get_date_range(self) -> tuple[datetime.date | None, datetime.date | None]:

@@ -311,6 +311,17 @@ def _build_deterministic_export_module(policy: Any, norm_stats: dict[str, Any] |
                 obs = torch.clamp(
                     (obs - self.obs_mean) / self.obs_std, -self.clip_obs, self.clip_obs
                 )
+            # LSTM+PPO 联合策略: 直接调用 policy.forward (自定义路径)
+            from aurumq_rl.lstm_joint_policy import LstmJointPolicy
+            # WaveHunter: 与 LstmJointPolicy 结构相同 (共享 LSTM+PPO 头), forward 返回 (acts, vals, log_prob)
+            from aurumq_rl.wavehunter_policy import WaveHunterPolicy
+            # v2 使用独立类，结构与 v1 相同但必须显式纳入导出识别。
+            from aurumq_rl.wavehunter_policy_v2 import WaveHunterPolicy as WaveHunterPolicyV2
+            # v3 双头模型 (2026-08-23): 与 v2 同 backbone, 独立 a1/a2 头, ONNX 结构兼容.
+            from aurumq_rl.wavehunter_policy_v3 import WaveHunterV3Policy
+            if isinstance(self.policy, (LstmJointPolicy, WaveHunterPolicy, WaveHunterPolicyV2, WaveHunterV3Policy)):
+                acts, _vals, _lp = self.policy.forward(obs, deterministic=True)
+                return acts
             if is_actor_critic:
                 features = BasePolicy.extract_features(
                     self.policy, obs, self.policy.pi_features_extractor

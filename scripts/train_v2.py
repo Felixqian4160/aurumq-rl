@@ -758,6 +758,48 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8",
     )
     print(f"[train_v2] training_summary saved: {args.out_dir / 'training_summary.json'}")
+
+    # Export ONNX for CPU inference (used by /api/sim & /api/p22c eval)
+    # The GPU-v2 policy (PerStockEncoderPolicy) has a custom features_extractor
+    # that the standard SB3 ONNX exporter doesn't capture; use the dedicated
+    # onnx_export_v2 which traces a minimal wrapper.
+    try:
+        from aurumq_rl.onnx_export_v2 import export_perstock_policy_to_onnx
+        onnx_path = args.out_dir / "policy.onnx"
+        meta_path = args.out_dir / "metadata.json"
+        export_perstock_policy_to_onnx(
+            model_path=final_path,
+            output_dir=args.out_dir,
+            obs_shape=(int(n_stocks), int(n_factors)),
+            training_timesteps=int(args.total_timesteps),
+            extra_metadata={
+                "stock_codes": list(panel.stock_codes),
+                "factor_names": list(panel.factor_names),
+                "factor_count": int(n_factors),
+                "top_k": int(args.top_k),
+                "framework": "gpu_v2",
+                "policy_class": "PerStockEncoderPolicy",
+                "reward_mode": args.reward_mode,
+                "obs_normalized": False,
+                "panel_dtype": args.panel_dtype,
+                "universe_filter": args.universe_filter,
+                "n_envs": int(args.n_envs),
+                "train_start_date": args.start_date,
+                "train_end_date": args.end_date,
+                "main_wave_config": {
+                    "hold_window": args.mwl_hold_window,
+                    "vol_window": args.mwl_vol_window,
+                    "sigma_multiplier": args.mwl_sigma_multiplier,
+                    "absolute_threshold": args.mwl_absolute_threshold,
+                    "amount_ma_min": args.mwl_amount_ma_min,
+                } if args.reward_mode in ("main_wave_hold", "main_wave_target") else None,
+            },
+        )
+        print(f"[train_v2] ONNX exported: {onnx_path}")
+    except Exception as e:
+        print(f"[train_v2] ONNX export FAILED: {e!r}")
+        print(f"[train_v2] (model still usable from ppo_final.zip; sim will need re-train or manual export)")
+
     return 0
 
 

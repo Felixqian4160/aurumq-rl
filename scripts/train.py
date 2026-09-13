@@ -20,16 +20,15 @@ Usage
     python scripts/train.py --smoke-test --out-dir /tmp/smoke
 
     # Real training on a single GPU
-    python scripts/train.py \\
-        --algorithm PPO \\
-        --total-timesteps 1000000 \\
-        --data-path data/factor_panel.parquet \\
-        --start-date 2023-01-01 \\
-        --end-date 2025-06-30 \\
-        --n-envs 6 \\
+    python scripts/train.py \
+        --algorithm PPO \
+        --total-timesteps 1000000 \
+        --data-path data/factor_panel.parquet \
+        --start-date 2023-01-01 \
+        --end-date 2025-06-30 \
+        --n-envs 6 \
         --out-dir models/ppo_v1
 """
-
 from __future__ import annotations
 
 import argparse
@@ -40,6 +39,15 @@ from pathlib import Path
 from typing import Any
 
 # Path setup
+import warnings
+warnings.filterwarnings('ignore', message='Gym has been unmaintained')
+warnings.filterwarnings('ignore', message='You are trying to run PPO on the GPU')
+
+# ── 显存优化（防碎片化 OOM，RTX 3060 12GB 实测）──
+# expandable_segments: 允许 PyTorch 动态扩展显存段，避免"reserved but unallocated"碎片
+import os
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root / "src") not in sys.path:
     sys.path.insert(0, str(_project_root / "src"))
@@ -165,15 +173,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Environment
     parser.add_argument(
         "--env-type",
-        choices=["stock_picking", "portfolio_weight"],
+        choices=["stock_picking", "portfolio_weight", "portfolio_weight_lstm"],
         default="stock_picking",
-        help="Environment type (default stock_picking)",
+        help="Environment type (default stock_picking; portfolio_weight_lstm = 端到端联合决策)",
     )
     parser.add_argument(
         "--n-factors",
         type=int,
-        default=64,
-        help="Number of factor dims (default 64; auto-truncated to available columns)",
+        default=None,
+        help="Number of factor dims (default None = use all available columns)",
     )
     parser.add_argument(
         "--top-k",
@@ -194,6 +202,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="One-side trading cost in bps (default 30)",
     )
 
+    # LSTM env extras (portfolio_weight_lstm)
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=20,
+        help="LSTM sliding window length (default 20)",
+    )
+    parser.add_argument(
+        "--lstm-hidden",
+        type=int,
+        default=128,
+        help="LSTM hidden dim (default 128)",
+    )
+    parser.add_argument(
+        "--use-knn",
+        action="store_true",
+        help="融合 KNN 特征通道（knn_fwd_ret + knn_dist）到 LSTM 输入（KNN+LSTM+PPO 单一模型）",
+    )
+    parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=20,
+        help="KNN 最近邻数量（--use-knn 时生效，default 20）",
+    )
+    parser.add_argument(
+        "--knn-ref-lookback",
+        type=int,
+        default=750,
+        help="KNN 参考集回看天数（default 750=3年，⚠ B4 deprecated：实际只决定采样起点，"
+             "不影响样本数（样本数由 --knn-max-ref-days 决定））",
+    )
+    parser.add_argument(
+        "--knn-max-ref-days",
+        type=int,
+        default=12,
+        help="KNN 采样天数上限（default 12，实测12天最优）",
+    )
+    parser.add_argument(
+        "--lstm-layers",
+        type=int,
+        default=1,
+        help="LSTM num layers (default 1)",
+    )
+
     # PortfolioWeight env extras
     parser.add_argument(
         "--reward-type",
@@ -212,6 +264,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.30,
         help="Max single-industry position pct (default 0.30)",
+    )
+    parser.add_argument(
+        "--rebalance-days",
+        type=int,
+        default=20,
+        help="Rebalance period in trading days (default 20, must match simulation)",
     )
     parser.add_argument(
         "--risk-aversion",
@@ -327,6 +385,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--target-kl set, may exit early. Ignored by A2C / SAC."
         ),
     )
+    # D4: GAE parameters
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+        help="Discount factor gamma (default 0.99). Lower=shorter horizon, 0.95=rebalance_days=20匹配",
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=0.95,
+        help="GAE lambda (default 0.95). Lower=more biased, higher=more variance",
+    )
 
     # Parallelism
     parser.add_argument(
@@ -379,6 +450,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output directory for checkpoints / ONNX / metrics",
     )
 
+    # 续训
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Path to existing model .zip to continue training from (e.g., models/ppo_v1/ppo_final.zip)",
+    )
+
     # Modes
     parser.add_argument(
         "--smoke-test",
@@ -424,6 +502,8 @@ def make_env(
     env_type: str,
     panel: Any,
     args: argparse.Namespace,
+    knn_panel=None,
+    _precomputed_tradeable_mask=None,
 ) -> Any:
     """Factory for SubprocVecEnv worker initialization."""
     seed = args.seed
@@ -453,32 +533,63 @@ def make_env(
                 # in _apply_trading_mask (None → pct-epsilon fallback).
                 close_panel=panel.close_array,
             )
-        else:
+        if env_type in ("portfolio_weight", "portfolio_weight_lstm"):
             from aurumq_rl.portfolio_weight_env import (
                 PortfolioWeightConfig,
                 PortfolioWeightEnv,
             )
 
-            config = PortfolioWeightConfig(
-                start_date=datetime.date.fromisoformat(args.start_date),
-                end_date=datetime.date.fromisoformat(args.end_date),
-                n_factors=panel.factor_array.shape[2],
-                forward_period=args.forward_period,
-                reward_type=args.reward_type,
-                risk_aversion=args.risk_aversion,
-                cost_bps=args.cost_bps,
-                max_position_pct=args.max_position_pct,
-                max_industry_pct=args.max_industry_pct,
-            )
-            env = PortfolioWeightEnv(
-                config=config,
-                factor_panel=panel.factor_array,
-                return_panel=panel.return_array,
-                pct_change_panel=panel.pct_change_array,
-                is_st_panel=panel.is_st_array,
-                is_suspended_panel=panel.is_suspended_array,
-                days_since_ipo_panel=panel.days_since_ipo_array,
-            )
+            if env_type == "portfolio_weight_lstm":
+                # 端到端联合决策环境：obs 含窗口历史，action = 仓位权重
+                from aurumq_rl.lstm_weight_env import LstmWeightConfig, LstmWeightEnv
+                cfg_lstm = LstmWeightConfig(
+                    start_date=datetime.date.fromisoformat(args.start_date),
+                    end_date=datetime.date.fromisoformat(args.end_date),
+                    n_factors=panel.factor_array.shape[2],
+                    window=getattr(args, 'window', 20),
+                    forward_period=args.forward_period,
+                    reward_type=args.reward_type,
+                    risk_aversion=args.risk_aversion,
+                    cost_bps=args.cost_bps,
+                    max_position_pct=args.max_position_pct,
+                    max_industry_pct=args.max_industry_pct,
+                    top_k=args.top_k,
+                    rebalance_days=getattr(args, 'rebalance_days', 20),
+                )
+                env = LstmWeightEnv(
+                    config=cfg_lstm,
+                    factor_panel=panel.factor_array,
+                    return_panel=panel.return_array,
+                    pct_change_panel=panel.pct_change_array,
+                    is_st_panel=panel.is_st_array,
+                    is_suspended_panel=panel.is_suspended_array,
+                    days_since_ipo_panel=panel.days_since_ipo_array,
+                    knn_panel=knn_panel,
+                    # 预计算完整可交易 mask（涨停/跌停/低量/新股/ST/停牌）—
+                    # 与模拟 build_tradeable_mask 单一真源，训练/模拟严格一致
+                    tradeable_mask=_precomputed_tradeable_mask,
+                )
+            else:
+                config = PortfolioWeightConfig(
+                    start_date=datetime.date.fromisoformat(args.start_date),
+                    end_date=datetime.date.fromisoformat(args.end_date),
+                    n_factors=panel.factor_array.shape[2],
+                    forward_period=args.forward_period,
+                    reward_type=args.reward_type,
+                    risk_aversion=args.risk_aversion,
+                    cost_bps=args.cost_bps,
+                    max_position_pct=args.max_position_pct,
+                    max_industry_pct=args.max_industry_pct,
+                )
+                env = PortfolioWeightEnv(
+                    config=config,
+                    factor_panel=panel.factor_array,
+                    return_panel=panel.return_array,
+                    pct_change_panel=panel.pct_change_array,
+                    is_st_panel=panel.is_st_array,
+                    is_suspended_panel=panel.is_suspended_array,
+                    days_since_ipo_panel=panel.days_since_ipo_array,
+                )
 
         env.reset(seed=seed + rank)
         return env
@@ -570,7 +681,6 @@ def run_training(args: argparse.Namespace) -> int:
     try:
         import torch  # noqa: F401
         from stable_baselines3 import A2C, PPO, SAC
-        from stable_baselines3.common.callbacks import CheckpointCallback
         from stable_baselines3.common.env_checker import check_env
         from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
     except ImportError as e:
@@ -589,6 +699,7 @@ def run_training(args: argparse.Namespace) -> int:
     from aurumq_rl.onnx_export import export_sb3_policy_to_onnx
     from aurumq_rl.sb3_callbacks import (
         CheckpointArtifactCallback,
+        ProgressLogCallback,
         WandbMetricsCallback,
     )
 
@@ -619,16 +730,41 @@ def run_training(args: argparse.Namespace) -> int:
         f"factor_names={panel.factor_names[:5]}..."
     )
 
-    # 2) Build a single-env first to validate via check_env
-    single_env_init = make_env(0, args.env_type, panel, args)
+    # ── KNN 特征通道（KNN+LSTM+PPO 融合）──
+    # 在训练区间上计算 knn_fwd_ret + knn_dist，拼接到 obs 输入
+    knn_panel = None
+    if getattr(args, 'use_knn', False):
+        from aurumq_rl.knn_features import compute_knn_features, KNN_FEATURE_NAMES
+        import time as _t
+        t0 = _t.time()
+        print(f"[train] 计算 KNN 特征 (k={args.knn_k}, ref_lookback={args.knn_ref_lookback}, max_ref_days={getattr(args, 'knn_max_ref_days', 60)})...")
+        knn_panel = compute_knn_features(
+            factor_panel=panel.factor_array,
+            return_panel=panel.return_array,
+            window=getattr(args, 'window', 20),
+            k=args.knn_k,
+            ref_lookback=args.knn_ref_lookback,
+            max_ref_days=getattr(args, 'knn_max_ref_days', 60),
+        )
+        print(f"[train] KNN 特征完成: {knn_panel.shape} ({_t.time()-t0:.0f}s) → 通道 {KNN_FEATURE_NAMES}")
+
+    # 2) 预计算完整可交易 mask（ST/停牌/新股/涨停/跌停/低量）—
+    #    与模拟 build_tradeable_mask 单一真源。训练/模拟严格一致，
+    #    避免模型学到"可买涨停股"而模拟时买不了。
+    from aurumq_rl.data_loader import build_tradeable_mask
+    precomputed_mask = build_tradeable_mask(panel)
+    print(f"[train] tradeable mask: 可交易比例 {precomputed_mask.mean()*100:.1f}%")
+
+    # 3) Build a single-env first to validate via check_env
+    single_env_init = make_env(0, args.env_type, panel, args, knn_panel, precomputed_mask)
     single_env = single_env_init()
     print("[train] validating environment...")
     check_env(single_env, warn=True)
     single_env.close()
 
-    # 3) Build VecEnv
+    # 4) Build VecEnv
     n_envs = args.n_envs
-    env_fns = [make_env(i, args.env_type, panel, args) for i in range(n_envs)]
+    env_fns = [make_env(i, args.env_type, panel, args, knn_panel, precomputed_mask) for i in range(n_envs)]
 
     if n_envs > 1:
         print(f"[train] using SubprocVecEnv n_envs={n_envs} method={args.vec_env_method}...")
@@ -657,12 +793,32 @@ def run_training(args: argparse.Namespace) -> int:
     algo_cls = {"PPO": PPO, "A2C": A2C, "SAC": SAC}[args.algorithm]
     lr = _make_lr_schedule(args.learning_rate, args.learning_rate_schedule)
     policy_kwargs = _parse_policy_kwargs(args.policy_kwargs_json)
+    # 端到端联合决策: 用 LSTM+PPO 联合策略（选股+择时一体）
+    if args.env_type == "portfolio_weight_lstm":
+        from aurumq_rl.lstm_joint_policy import LstmJointPolicy
+        policy_cls = LstmJointPolicy
+        policy_kwargs = policy_kwargs or {}
+        policy_kwargs.setdefault("lstm_hidden", getattr(args, 'lstm_hidden', 128))
+        policy_kwargs.setdefault("lstm_layers", getattr(args, 'lstm_layers', 1))
+        # 传入 3D shape 信息（obs 是1D flatten）
+        n_stocks = panel.factor_array.shape[1]
+        window = getattr(args, 'window', 20)
+        n_factors = panel.factor_array.shape[2]
+        # KNN 特征通道: LSTM 输入维度 = 因子数 + KNN 特征数
+        n_knn = knn_panel.shape[2] if knn_panel is not None else 0
+        if n_knn > 0:
+            print(f"[train] LSTM 输入 = {n_factors} 因子 + {n_knn} KNN 通道 = {n_factors + n_knn}")
+        policy_kwargs['_n_stocks'] = n_stocks
+        policy_kwargs['_window'] = window
+        policy_kwargs['_n_factors'] = n_factors + n_knn
+    else:
+        policy_cls = "MlpPolicy"
     algo_kwargs: dict[str, Any] = {
-        "policy": "MlpPolicy",
+        "policy": policy_cls,
         "env": vec_env,
         "learning_rate": lr,
         "policy_kwargs": policy_kwargs or None,
-        "verbose": 1,
+        "verbose": 0,  # 关掉 SB3 自带的 stdout 表格，避免与 WandbMetricsCallback 双输出
         "seed": args.seed,
         "tensorboard_log": str(out_dir / "tb_logs"),
     }
@@ -682,17 +838,38 @@ def run_training(args: argparse.Namespace) -> int:
             algo_kwargs["n_epochs"] = args.n_epochs
     if args.algorithm in {"PPO", "A2C"} and args.n_steps is not None:
         algo_kwargs["n_steps"] = args.n_steps
-    model = algo_cls(**algo_kwargs)
+    # D4: gamma + gae_lambda（折扣因子 + GAE lambda）
+    if args.gamma != 0.99:
+        algo_kwargs["gamma"] = args.gamma
+    if args.gae_lambda != 0.95:
+        algo_kwargs["gae_lambda"] = args.gae_lambda
+
+    # ── 创建模型（续训 vs 新训练分离）──
+    if args.resume_from:
+        from stable_baselines3 import PPO as _PPO
+        print(f"[info] Resuming training from {args.resume_from}")
+        model = _PPO.load(args.resume_from, env=vec_env, device="auto", verbose=0)  # 关掉 SB3 stdout 表格
+        # 覆盖关键超参数（学习率、步数等）
+        # P0 fix: 补全 max_grad_norm + target_kl，避免续训时梯度裁剪阈值不一致
+        # P1 fix: learning_rate 已经是 _make_lr_schedule 处理后的值（float 或 callable），
+        # 直接用 algo_kwargs 里的 lr 变量，确保 schedule 模式（linear/cosine）在续训时也生效
+        _resume_overrides = ('learning_rate', 'batch_size', 'n_steps', 'n_epochs',
+                             'max_grad_norm', 'target_kl', 'gamma', 'gae_lambda')
+        overrides = {k: v for k, v in algo_kwargs.items() if k in _resume_overrides}
+        for k, v in overrides.items():
+            if hasattr(model, k):
+                setattr(model, k, v)
+                print(f"[info]   override {k} = {v}")
+    else:
+        model = algo_cls(**algo_kwargs)
 
     # 6) Callbacks
     metrics_path = out_dir / "training_metrics.jsonl"
     checkpoint_freq_per_env = max(args.checkpoint_freq // n_envs, 1)
 
-    checkpoint_cb = CheckpointCallback(
-        save_freq=checkpoint_freq_per_env,
-        save_path=str(out_dir / "checkpoints"),
-        name_prefix=args.algorithm.lower(),
-    )
+    # NOTE: 不用 SB3 内置 CheckpointCallback — 它没有 try/except 保护，
+    # 保存失败（OOM/disk full/fd exhaustion）会直接杀死整个训练。
+    # 只用自定义 CheckpointArtifactCallback（有 try/except 保护）。
     wandb_metrics_cb = WandbMetricsCallback(
         wandb_logger=wandb_logger,
         jsonl_path=metrics_path,
@@ -709,13 +886,17 @@ def run_training(args: argparse.Namespace) -> int:
         jsonl_path=out_dir / "gpu.jsonl",
         sample_interval_seconds=2.0,
     )
+    progress_cb = ProgressLogCallback(
+        total_timesteps=args.total_timesteps,
+        log_every=max(5000 // n_envs, 100),
+    )
 
     # 7) Train
     print(f"[train] training for {args.total_timesteps:,} steps (n_envs={n_envs})...")
     model.learn(
         total_timesteps=args.total_timesteps,
-        callback=[checkpoint_cb, wandb_metrics_cb, wandb_artifact_cb, gpu_cb],
-        progress_bar=True,
+        callback=[wandb_metrics_cb, wandb_artifact_cb, gpu_cb, progress_cb],
+        progress_bar=False,  # 用 ProgressLogCallback 代替 tqdm
     )
 
     if args.vec_normalize:
@@ -744,9 +925,20 @@ def run_training(args: argparse.Namespace) -> int:
     # 9) Export ONNX
     n_stocks = panel.factor_array.shape[1]
     n_factors = panel.factor_array.shape[2]
+    n_knn = knn_panel.shape[2] if knn_panel is not None else 0
+
+    # B1 修复：导出前强制 clamp log_std，防止训练后期 log_std 漂移破坏模拟
+    if args.env_type == "portfolio_weight_lstm" and hasattr(model.policy, 'log_std'):
+        with torch.no_grad():
+            model.policy.log_std.data.clamp_(-5.0, 2.0)
+        print(f"[train] log_std clamped to [-5, 2] before ONNX export")
 
     if args.env_type == "stock_picking":
         obs_shape = (n_stocks * n_factors,)
+    elif args.env_type == "portfolio_weight_lstm":
+        # 1D flatten obs (policy 内部 reshape 为 3D) — 含 KNN 通道
+        window = getattr(args, 'window', 20)
+        obs_shape = (n_stocks * window * (n_factors + n_knn),)
     else:
         obs_shape = (n_stocks * (n_factors + 1),)
     print(f"[train] exporting ONNX (obs_shape={obs_shape})...")
@@ -770,6 +962,20 @@ def run_training(args: argparse.Namespace) -> int:
             "env_type": args.env_type,
             "reward_type": args.reward_type,
             "top_k": args.top_k,
+            "forward_period": args.forward_period,
+            "window": getattr(args, 'window', None),
+            "lstm_hidden": getattr(args, 'lstm_hidden', None),
+            "lstm_layers": getattr(args, 'lstm_layers', None),
+            "max_position_pct": args.max_position_pct,
+            "max_industry_pct": args.max_industry_pct,
+            "rebalance_days": args.rebalance_days,
+            "cost_bps": args.cost_bps,
+            "learning_rate": args.learning_rate,
+            "max_grad_norm": args.max_grad_norm,
+            "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "n_epochs": args.n_epochs,
+            "target_kl": getattr(args, 'target_kl', None),
             "factor_count": n_factors,
             # Persist the EXACT training universe + factor order so eval_backtest
             # can align an arbitrary val panel to the same shape.
@@ -780,6 +986,10 @@ def run_training(args: argparse.Namespace) -> int:
             # Per-prefix scalar weights applied AFTER z-score during training.
             # eval_backtest reads this back so OOS uses the same scaling.
             "feature_group_weights": feature_group_weights,
+            "knn_k": getattr(args, 'knn_k', 20),
+            "knn_ref_lookback": getattr(args, 'knn_ref_lookback', 750),
+            "knn_max_ref_days": getattr(args, 'knn_max_ref_days', 12),
+            "use_knn": getattr(args, 'use_knn', False),
         },
     )
     print(f"[train] ONNX exported: {onnx_path}")
@@ -807,6 +1017,26 @@ def run_training(args: argparse.Namespace) -> int:
                 "n_stocks": n_stocks,
                 "top_k": args.top_k,
                 "feature_group_weights": feature_group_weights,
+                # ── 完整超参数（可追溯审计）──
+                "window": getattr(args, 'window', None),
+                "forward_period": args.forward_period,
+                "lstm_hidden": getattr(args, 'lstm_hidden', None),
+                "lstm_layers": getattr(args, 'lstm_layers', None),
+                "cost_bps": args.cost_bps,
+                "max_position_pct": args.max_position_pct,
+                "max_industry_pct": args.max_industry_pct,
+                "rebalance_days": getattr(args, 'rebalance_days', None),
+                "learning_rate": args.learning_rate,
+                "max_grad_norm": args.max_grad_norm,
+                "n_steps": args.n_steps,
+                "batch_size": args.batch_size,
+                "n_epochs": args.n_epochs,
+                "target_kl": getattr(args, 'target_kl', None),
+                "seed": args.seed,
+                "use_knn": bool(getattr(args, 'use_knn', False)),
+                "knn_k": getattr(args, 'knn_k', None),
+                "knn_ref_lookback": getattr(args, 'knn_ref_lookback', None),
+                "knn_max_ref_days": getattr(args, 'knn_max_ref_days', None),
                 "out_dir": str(out_dir),
                 "onnx_path": str(onnx_path),
                 "metrics_summary": summary,

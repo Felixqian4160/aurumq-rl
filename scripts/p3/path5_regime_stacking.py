@@ -74,17 +74,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--paths", nargs="+", default=("sl_path1", "sl_path4", "sl_path2"))
     ap.add_argument("--top-k-configs", type=int, default=3)
     ap.add_argument("--out", default=Path("runs/sl_regime_stack"), type=Path)
+    ap.add_argument("--runs-root", default=None, type=Path,
+                    help="Base directory for path subdirs (default: runs/)")
     args = ap.parse_args(argv)
 
+    runs_root = args.runs_root or Path("runs")
     args.out.mkdir(parents=True, exist_ok=True)
 
     # 1. Build per-path ensemble predictions
     path_ens = {}
     chosen_per_path = {}
     for p in args.paths:
-        runs_dir = Path("runs") / p
+        runs_dir = runs_root / p
         if not runs_dir.exists():
-            logger.warning("path %s missing — skipping", p)
+            logger.warning("path %s missing (%s) — skipping", p, runs_dir)
             continue
         ens, chosen = _build_path_ensemble(runs_dir, top_k=args.top_k_configs)
         path_ens[p] = ens
@@ -206,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 10. Eval
     realized = pl.read_parquet(args.bundle / "realized_returns.parquet").select(
-        ["trade_date", "ts_code", "pct_chg_t_plus_1"]
+        ["trade_date", "ts_code", pl.col("return_1d").alias("pct_chg_t_plus_1")]
     )
     market = pl.read_parquet(args.bundle / "market_returns.parquet").select(
         ["trade_date", "eq_weight_pct_chg_t_plus_1"]

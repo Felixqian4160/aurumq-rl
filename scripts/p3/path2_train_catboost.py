@@ -43,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--early-stopping-rounds", type=int, default=50)
     ap.add_argument("--l2-leaf-reg", type=float, default=3.0)
     ap.add_argument("--n-jobs", type=int, default=-1)
+    ap.add_argument("--gpu", action="store_true", help="Use GPU")
     ap.add_argument("--train-start", default=None, help="ISO date; overrides TRAIN_EFF[0]")
     ap.add_argument("--train-end", default=None, help="ISO date; overrides TRAIN_EFF[1]")
     args = ap.parse_args(argv)
@@ -72,10 +73,18 @@ def main(argv: list[str] | None = None) -> int:
         df = feat_df.join(target_y, on=["trade_date", "ts_code"], how="inner")
         logger.info("joined: %d rows", len(df))
 
+    # Ensure trade_date is Date type (P3 bundles may store as String)
+    if df["trade_date"].dtype == pl.String:
+        df = df.with_columns(pl.col("trade_date").str.slice(0, 10).str.to_date("%Y-%m-%d"))
+        logger.info("converted trade_date to Date type")
+
     train_df = df.filter((pl.col("trade_date") >= train_lo) & (pl.col("trade_date") <= train_hi))
     val_df = df.filter((pl.col("trade_date") >= VAL_EFF[0]) & (pl.col("trade_date") <= VAL_EFF[1]))
+    # Drop NaN in target (CatBoost cannot handle NaN in target)
+    train_df = train_df.drop_nulls(["y"])
+    val_df = val_df.drop_nulls(["y"])
     logger.info("TRAIN window: [%s, %s]", train_lo, train_hi)
-    logger.info("splits: train=%d val=%d", len(train_df), len(val_df))
+    logger.info("splits: train=%d val=%d (after dropping NaN target)", len(train_df), len(val_df))
 
     X_train = train_df.select(feature_cols).to_numpy()
     y_train = train_df["y"].to_numpy().astype(np.float32)
@@ -95,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         "thread_count": getattr(args, "n_jobs", -1),
         "allow_writing_files": False,  # don't pollute cwd with catboost_info/
     }
+    if args.gpu:
+        params["task_type"] = "GPU"
+        logger.info("using GPU for training")
     logger.info("training catboost: depth=%d lr=%.3f iters=%d",
                 args.depth, args.learning_rate, args.num_iterations)
     t1 = time.time()
@@ -106,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 3. Predict on full eval frame
     X_all = df.select(feature_cols).to_numpy()
+    X_all[~np.isfinite(X_all)] = 0.0
     score_all = model.predict(X_all).astype(np.float32)
     pred_df = df.select(["trade_date", "ts_code"]).with_columns(pl.Series("score", score_all))
 
@@ -116,11 +129,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Eval
     realized = pl.read_parquet(args.bundle / "realized_returns.parquet").select(
-        ["trade_date", "ts_code", "pct_chg_t_plus_1"]
+        ["trade_date", "ts_code", pl.col("return_1d").alias("pct_chg_t_plus_1")]
     )
-    market = pl.read_parquet(args.bundle / "market_returns.parquet").select(
-        ["trade_date", "eq_weight_pct_chg_t_plus_1"]
-    )
+    market_path = args.bundle / "market_returns.parquet"
+    if market_path.exists():
+        market = pl.read_parquet(market_path).select(
+            ["trade_date", "eq_weight_pct_chg_t_plus_1"]
+        )
+    else:
+        market = realized.group_by("trade_date").agg(
+            pl.col("pct_chg_t_plus_1").mean().alias("eq_weight_pct_chg_t_plus_1")
+        ).select(["trade_date", "eq_weight_pct_chg_t_plus_1"])
     val_eval = evaluate(pred_df, target_y, realized, market, VAL_EFF)
     h1_eval = evaluate(pred_df, target_y, realized, market, H1)
     h2_eval = evaluate(pred_df, target_y, realized, market, H2)
@@ -137,6 +156,18 @@ def main(argv: list[str] | None = None) -> int:
         "H2": h2_eval,
     }
     (args.out / "results.json").write_text(json.dumps(summary, indent=2, default=str))
+
+    # Save metadata for WebUI display
+    n_stocks = df["ts_code"].n_unique()
+    meta = {
+        "n_stocks": n_stocks,
+        "total_timesteps": len(train_df),
+        "best_iteration": best_iter,
+        "train_time_s": round(train_time, 1),
+        "features": len(feature_cols),
+    }
+    (args.out / "metadata.json").write_text(json.dumps(meta, indent=2))
+    logger.info("saved metadata.json: %d stocks, %d train rows", n_stocks, len(train_df))
     logger.info("VAL primary=%.6f  H1 primary=%.6f  H2 primary=%.6f",
                 val_eval["primary_mean_top50_proximity_excess"],
                 h1_eval["primary_mean_top50_proximity_excess"],

@@ -18,6 +18,7 @@ NaN-handling treats them consistently.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -91,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bundle", default="data/p3_4070", type=Path)
     ap.add_argument("--feature-panel-in", default="feature_panel_v3_344.parquet")
     ap.add_argument("--feature-panel-out", default="feature_panel_clean.parquet")
+    ap.add_argument("--out", type=Path, default=None, help="Output runs dir for metadata")
     args = ap.parse_args(argv)
 
     in_path = args.bundle / args.feature_panel_in
@@ -123,6 +125,19 @@ def main(argv: list[str] | None = None) -> int:
 
     out.write_parquet(out_path, compression="zstd", compression_level=9)
     logger.info("wrote %s (%.1f MB)", out_path, out_path.stat().st_size / 1e6)
+
+    # Save metadata for WebUI display
+    if args.out:
+        args.out.mkdir(parents=True, exist_ok=True)
+        n_stocks = out["ts_code"].n_unique()
+        meta = {
+            "n_stocks": n_stocks,
+            "total_timesteps": len(out),
+            "features": len(feature_cols),
+            "output": str(out_path),
+        }
+        (args.out / "metadata.json").write_text(json.dumps(meta, indent=2))
+        logger.info("saved metadata.json: %d stocks, %d rows, %d features", n_stocks, len(out), len(feature_cols))
     return 0
 
 

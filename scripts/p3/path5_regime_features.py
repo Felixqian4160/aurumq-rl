@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     # 1. Load realized returns + universe + market
     t0 = time.time()
     realized = pl.read_parquet(args.bundle / "realized_returns.parquet").select(
-        ["trade_date", "ts_code", "pct_chg_t_plus_1"]
+        ["trade_date", "ts_code", pl.col("return_1d").alias("pct_chg_t_plus_1")]
     )
     market = pl.read_parquet(args.bundle / "market_returns.parquet").select(
         ["trade_date", "eq_weight_pct_chg_t_plus_1"]

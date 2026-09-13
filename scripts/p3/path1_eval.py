@@ -123,6 +123,15 @@ def evaluate(
     to ``window``. Computes T+1/T+2/T+3 excess returns inline for hit-rate.
     """
     lo, hi = window
+    # Ensure trade_date is Date type (P3 bundles may store as String)
+    def _ensure_date(df: pl.DataFrame) -> pl.DataFrame:
+        if "trade_date" in df.columns and df["trade_date"].dtype == pl.String:
+            return df.with_columns(pl.col("trade_date").str.slice(0, 10).str.to_date("%Y-%m-%d"))
+        return df
+    predictions = _ensure_date(predictions)
+    target_y = _ensure_date(target_y)
+    realized = _ensure_date(realized)
+    market = _ensure_date(market)
     pred_w = predictions.filter((pl.col("trade_date") >= lo) & (pl.col("trade_date") <= hi))
     y_w = target_y.filter((pl.col("trade_date") >= lo) & (pl.col("trade_date") <= hi))
     df = pred_w.join(y_w, on=["trade_date", "ts_code"], how="inner")

@@ -141,3 +141,48 @@ run_phase26ef_overnight.sh
 docs/phase26/
 docs/superpowers/
 docs/TRAINING_HISTORY.md
+
+# Local agent state, credentials, and one-off workspace files
+.hermes/
+.qbot_token
+=1.42
+tmp/
+tmp_*.py
+*.flag
+*.bak-*
+
+# Generated research evidence and runtime outputs
+evidence/
+data_cache/
+data/_build_logs/
+data/_build_runtime/
+data/task_runtime/
+data/task_runtime_archive/
+data/training_logs/
+data/ledgers/
+data/threshold_calibration/
+data/threshold_calibration_holdout/
+data/raw_*/
+data/p3_*/
+data/wavehunter_v2_matrix/
+data/*.json
+data/**/*.json
+data/*.csv
+data/**/*.csv
+data/*.log
+data/**/*.log
+
+# Keep only the documented synthetic fixture and data contract in data/.
+data/*
+!data/README.md
+!data/synthetic_demo.parquet
+
+# Generated research files under scripts/ (source code remains tracked explicitly)
+scripts/*.json
+scripts/*.log
+scripts/*.csv
+scripts/*.png
+scripts/p3/*.json
+scripts/p3/*.log
+scripts/p3/*.csv
+scripts/p3/*.png
