@@ -1,13 +1,15 @@
 """routers/pivots.py — 高低点标注校验 API"""
 from __future__ import annotations
+import os
 import re
 from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 import polars as pl
-router = APIRouter(tags=["pivots"])
 
 from core.config import AURUMQ_ROOT, DATA_DIR
+
+router = APIRouter(tags=["pivots"])
 _V9_NAME = "wavehunter_v9_hs300_20040102_20260804.parquet"
 _V8_NAME = "wavehunter_v8_hs300_20040102_20260804.parquet"
 

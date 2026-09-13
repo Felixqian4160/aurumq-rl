@@ -4,6 +4,7 @@ train_control/services/data_service.py — 数据服务单一真源
 """
 from __future__ import annotations
 
+import os
 import time
 import threading
 from pathlib import Path
@@ -13,7 +14,9 @@ from core.config import AURUMQ_ROOT
 
 DATA_CACHE_DIR = AURUMQ_ROOT / "data_cache"
 DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-TOKEN_FILE = AURUMQ_ROOT / ".qbot_token"
+
+# Read credentials from an external file or environment; never require a token in repo files.
+TOKEN_FILE = Path(os.environ.get("AURUMQ_TUSHARE_TOKEN_FILE", Path.home() / ".tushare_token"))
 
 _TUSHARE_CALL_LOCK = threading.Lock()
 _TUSHARE_LAST_CALL = 0.0

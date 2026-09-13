@@ -4,16 +4,19 @@ routers/data_mgmt.py — 数据管理 API（瘦身版）
 """
 import os, time, json, threading, subprocess, uuid
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .common import AURUMQ_ROOT, log, BUILD_LOG_DIR, BUILD_RUNTIME_DIR as RUNTIME_DIR
+from core.config import AURUMQ_ROOT, BUILD_LOG_DIR, BUILD_RUNTIME_DIR as RUNTIME_DIR
+from .common import log
 import services.data_service as ds
 
 router = APIRouter(tags=['data_mgmt'])
 
-TOKEN_FILE = AURUMQ_ROOT / '.qbot_token'
+# Store credentials outside the repository by default; override explicitly when needed.
+TOKEN_FILE = Path(os.environ.get("AURUMQ_TUSHARE_TOKEN_FILE", Path.home() / ".tushare_token"))
 DATA_CACHE_DIR = ds.DATA_CACHE_DIR
 DOWNLOAD_PROGRESS: dict = {}
 _download_start: dict = {}
